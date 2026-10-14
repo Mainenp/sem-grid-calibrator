@@ -1,0 +1,156 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>SEM Grid Calibrator</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <header>
+    <div>
+      <p class="eyebrow">SEM CALIBRATION WORKBENCH</p>
+      <h1>Grid line extraction</h1>
+      <p class="subtitle">Robust line fitting for distortion calibration standards</p>
+    </div>
+    <div class="status" id="status"><span></span><b>Ready</b></div>
+  </header>
+
+  <main>
+    <aside>
+      <section>
+        <h2>Source</h2>
+        <div class="file-card">
+          <div class="file-icon">TIF</div>
+          <div><strong id="filename">0.5kv-2000x-4K_07.tif</strong><small id="dimensions">Not loaded</small></div>
+        </div>
+        <button id="load" class="secondary">Load current image</button>
+        <input id="sourceFile" class="file-input source-input" type="file" accept=".tif,.tiff,image/tiff">
+        <button id="loadSource" class="secondary" disabled>Use selected TIFF</button>
+        <button id="restoreDefaultSource" class="secondary">Restore default sample</button>
+        <label class="field-label">Actual horizontal FOV (µm, optional)
+          <input id="physicalFov" type="number" min="0.000001" step="any" placeholder="Blank = estimate from magnification">
+        </label>
+        <p class="hint">FOV is applied on the next extraction. Estimated nm is not a calibrated measurement.</p>
+      </section>
+
+      <section>
+        <h2>Detection</h2>
+        <p class="hint">The specimen region is isolated from the SEM footer. Grid pitch is estimated automatically, then centerlines are robustly fitted through the bright square interiors.</p>
+        <button id="extract" class="primary" disabled><span>⌁</span> Extract grid lines</button>
+        <button id="distortion" class="secondary" disabled>Compute distortion field</button>
+        <button id="restoreLines" class="secondary" disabled>Restore excluded lines</button>
+      </section>
+
+      <section class="batch-section">
+        <h2>Batch analysis</h2>
+        <p class="hint">Select multiple TIFF images. Files are uploaded and analyzed one at a time to limit memory usage.</p>
+        <input id="batchFiles" class="file-input" type="file" accept=".tif,.tiff,image/tiff" multiple>
+        <div class="batch-selection" id="batchSelection">No files selected</div>
+        <button id="batchAnalyze" class="primary" disabled>Analyze selected files</button>
+        <div class="batch-progress" id="batchProgress" hidden>
+          <div><span id="batchProgressLabel">0 / 0</span><b id="batchProgressPercent">0%</b></div>
+          <progress id="batchProgressBar" value="0" max="1"></progress>
+        </div>
+        <div class="batch-list" id="batchResults" aria-live="polite"></div>
+        <button id="batchExportCsv" class="secondary" disabled>Export summary CSV</button>
+        <button id="batchExportJson" class="secondary" disabled>Export summary JSON</button>
+      </section>
+
+      <section class="parameter-section">
+        <h2>参数依赖分析</h2>
+        <button id="dependencyToggle" class="secondary" aria-expanded="false" aria-controls="dependencyPanel">展开参数依赖图表</button>
+      </section>
+
+      <section class="results" id="results">
+        <h2>Results</h2>
+        <div class="metric"><span>Column centerlines</span><b id="verticalCount">—</b></div>
+        <div class="metric"><span>Row centerlines</span><b id="horizontalCount">—</b></div>
+        <div class="metric"><span>Segmented squares</span><b id="squareCount">—</b></div>
+        <div class="metric"><span>Centers in distortion fit</span><b id="fitCenterCount">—</b></div>
+        <div class="metric"><span>Quality status</span><b id="qualityStatus">—</b></div>
+        <div class="metric"><span>分区重复周期 列 / 行</span><b id="clusterPeriod">—</b></div>
+        <p class="hint field-hint" id="clusterHint">有稳定重复分区时保留样品间距；证据不足时使用等间距参考。</p>
+        <div class="metric"><span>Minimum row / column coverage</span><b id="coverage">—</b></div>
+        <div class="metric"><span>Row / column line-fit P95</span><b id="lineResidual">—</b></div>
+        <div class="metric"><span>Field-fit residual P95</span><b id="fitResidual">—</b></div>
+        <div class="metric"><span>Grid pitch X</span><b id="pitchX">—</b></div>
+        <div class="metric"><span>Grid pitch Y</span><b id="pitchY">—</b></div>
+        <div class="metric"><span>Row tilt from horizontal</span><b id="rowTilt">—</b></div>
+        <div class="metric"><span>Column tilt from vertical</span><b id="columnTilt">—</b></div>
+        <div class="metric"><span>Row / column angle</span><b id="includedAngle">—</b></div>
+        <div class="metric"><span>Rectified grid pitch</span><b id="rectifiedPitch">—</b></div>
+        <button id="exportRectified" class="secondary" disabled>Export rectified PNG</button>
+        <button id="exportCompensated" class="secondary" disabled>导出完整畸变补偿 PNG</button>
+        <button id="validateCompensation" class="secondary" disabled>重新检测补偿图并验证</button>
+        <p class="hint field-hint" id="compensationResult" aria-live="polite">完整补偿包括旋转、剪切、横纵尺度差及平滑非线性位移。原回正预览仍仅显示仿射回正。</p>
+        <button id="exportJson" class="secondary" disabled>Export line data</button>
+        <button id="exportPng" class="secondary" disabled>Export overlay PNG</button>
+      </section>
+      <section class="results" id="distortionResults">
+        <h2>Distortion field</h2>
+        <label class="field-label">Displacement unit
+          <select id="fieldUnit">
+            <option value="scanPercent">% of scan width</option>
+            <option value="nm">nm</option>
+            <option value="um">µm</option>
+            <option value="pitchPercent">% of grid pitch</option>
+            <option value="px">px</option>
+          </select>
+        </label>
+        <p id="scaleSource" class="hint">Physical scale has not been loaded.</p>
+        <label class="field-label">Displayed component
+          <select id="fieldComponent" disabled>
+            <option value="total">Total field</option>
+            <option value="nonlinear">Nonlinear (affine removed)</option>
+            <option value="radial">Radial</option>
+            <option value="tangential">Tangential</option>
+            <option value="affine">Affine / shear</option>
+            <option value="residual">Model residual</option>
+          </select>
+        </label>
+        <div class="metric"><span>Radial type</span><b id="radialType">—</b></div>
+        <div class="metric"><span>Radial edge shift</span><b id="radialEdge">—</b></div>
+        <div class="metric"><span>k₁ / k₂ / k₃</span><b id="radialCoeffs">—</b></div>
+        <div class="metric"><span>p₁ / p₂</span><b id="tangentCoeffs">—</b></div>
+        <div class="metric"><span>Ideal square pitch</span><b id="idealPitch">—</b></div>
+        <div class="metric"><span>Image dimensions</span><b id="imageSize">—</b></div>
+        <div class="metric"><span>Pixel size</span><b id="pixelSize">—</b></div>
+        <div class="metric"><span>Mean magnitude</span><b id="distMean">—</b></div>
+        <div class="metric"><span>RMS magnitude</span><b id="distRms">—</b></div>
+        <div class="metric"><span>95th percentile</span><b id="distP95">—</b></div>
+        <div class="metric"><span>Maximum</span><b id="distMax">—</b></div>
+        <div class="heat-legend"><span id="legendZero">0</span><i></i><span id="legendMax">max</span></div>
+        <p class="hint field-hint">White arrows show direction; their display length is scaled and capped.</p>
+      </section>
+    </aside>
+
+    <section class="viewer-panel">
+      <div class="viewer-toolbar">
+        <div class="legend"><span class="v-line"></span> Vertical fit <span class="h-line"></span> Horizontal fit</div>
+        <div class="viewer-actions">
+          <button id="fitView" class="tool-button" disabled>Fit view</button>
+          <label title="Preview the global affine correction in the viewer"><input type="checkbox" id="rectifiedToggle" disabled> Rectified preview</label>
+          <label><input type="checkbox" id="toggle" checked disabled> Show overlay</label>
+          <label><input type="checkbox" id="pixelsToggle" disabled> Square pixels</label>
+          <label><input type="checkbox" id="centersToggle" disabled> Centers</label>
+          <label><input type="checkbox" id="distortionToggle" disabled> Distortion</label>
+        </div>
+      </div>
+      <div class="viewer" id="viewer">
+        <div class="empty" id="empty"><div>⌗</div><strong>No image loaded</strong><span>Load the calibration TIFF to begin</span></div>
+        <canvas id="canvas"></canvas>
+        <div class="loader" id="loader"><i></i><span>Analyzing grid structure…</span></div>
+      </div>
+      <div class="footerbar"><span id="zoomLabel">Zoom: —</span><span>Click line to exclude · Wheel to zoom · Drag to pan · Double-click to fit</span></div>
+    </section>
+    <section id="dependencyPanel" class="dependency-panel" aria-label="参数依赖折线图" hidden>
+      <div class="dependency-actions"><button id="dependencyClose" class="dependency-close" type="button" aria-label="收起参数依赖图表" title="收起">×</button></div>
+      <div id="dependencyCharts" class="dependency-charts"></div>
+    </section>
+  </main>
+  <script src="units.js"></script>
+  <script src="app.js"></script>
+  <script src="parameter-inline.js"></script>
+</body>
+</html>

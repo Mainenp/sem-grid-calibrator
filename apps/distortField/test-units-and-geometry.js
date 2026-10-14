@@ -1,0 +1,31 @@
+const assert=require('assert/strict');
+const units=require('./public/units');
+const {correction,transform}=require('./orthogonality');
+const {dependency}=require('./parameter-dependencies');
+const field={image:{width:4096},idealPitch:64,physical:{nanometersPerPixel:10}};
+assert.equal(units.convert(40.96,field,'scanPercent'),1);
+assert.equal(units.convert(32,field,'pitchPercent'),50);
+assert.equal(units.convert(3,field,'nm'),30);
+assert.equal(units.convert(3,field,'um'),.03);
+assert.equal(units.convert(3,{...field,physical:{nanometersPerPixel:null}},'nm'),null);
+assert.equal(units.convert(81.92,{...field,image:{width:8192}},'scanPercent'),1);
+for(const angle of [85,88.8,90,93]) for(const tilt of [-8,0,.3,12]) {
+  const matrix=correction({includedAngleDegrees:angle,rowTiltDegrees:tilt}).correctionMatrix;
+  const t=tilt*Math.PI/180,a=angle*Math.PI/180;
+  const u={x:80*Math.cos(t),y:80*Math.sin(t)},v={x:95*Math.cos(t+a),y:95*Math.sin(t+a)};
+  const U=transform(u,matrix),V=transform(v,matrix);
+  assert.ok(Math.abs(U.x*V.x+U.y*V.y)<1e-8);
+  assert.ok(Math.hypot(U.x-u.x,U.y-u.y)<1e-10);
+  assert.ok(Math.abs(matrix[0][0]*matrix[1][1]-matrix[0][1]*matrix[1][0]-1)<1e-10);
+}
+assert.throws(()=>correction({includedAngleDegrees:0,rowTiltDegrees:0}));
+const records=[1,2,3].map(x=>({batch:'A',voltageKv:x,magnification:2000,resolutionK:8,y:x*x}));
+assert.equal(dependency(records,'voltageKv','y').matchedStrata,1);
+assert.equal(dependency(records.map((r,i)=>({...r,resolutionK:i+1})),'voltageKv','y').matchedStrata,0);
+assert.equal(dependency(records,'minutesAfterCalibration','y').matchedStrata,0);
+const batches=[{...records[0],batch:'20260915',acquisitionDay:0,y:10},{...records[0],batch:'20260923',acquisitionDay:8,y:5}];
+assert.equal(dependency(batches,'acquisitionDay','y').matchedStrata,1);
+assert.equal(dependency(batches,'acquisitionDay','y').strata[0].relativeChangePercent,-50);
+assert.equal(dependency(batches.map((r,i)=>({...r,magnification:1000+i*1000})),'acquisitionDay','y').matchedStrata,0);
+assert.equal(dependency([{...records[0],y:0},{...records[1]}],'voltageKv','y').strata[0].relativeChangePercent,null);
+console.log('Unit scaling, unavailable physical scale, exact angle-only geometry, matched controls and missing-time tests passed');

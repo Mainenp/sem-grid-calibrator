@@ -1,0 +1,12 @@
+node_modules/
+.DS_Store
+.idea/
+__pycache__/
+*.pyc
+.tmp_*
+*.tif
+*.tiff
+apps/distortField/data/
+apps/distortField/results/
+apps/distortField/public/parameter-analysis-data.json
+apps/distortField/public/parameter-report.html

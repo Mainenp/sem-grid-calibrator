@@ -1,0 +1,12 @@
+{
+  "name": "sem-grid-calibrator-workspace",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Private source snapshot of the SEM square-grid distortion analysis application",
+  "workspaces": ["apps/distortField"],
+  "scripts": {
+    "start": "npm run start --workspace=distort-field",
+    "start:distortField": "npm run start --workspace=distort-field",
+    "test": "node apps/distortField/test-cluster-lattice.js && node apps/distortField/test-full-compensation.js && node apps/distortField/test-units-and-geometry.js && node apps/distortField/test-canvas-redraw.js && node apps/distortField/test-preview-loading.js && node apps/distortField/test-tiff-compatibility.js"
+  }
+}

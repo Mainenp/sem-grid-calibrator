@@ -1,0 +1,10 @@
+# Local datasets, generated results and report snapshots are not source code.
+results/
+__pycache__/
+*.pyc
+.tmp_*
+.DS_Store
+public/parameter-analysis-data.json
+public/parameter-report.html
+ALGORITHM_UPDATE_SUMMARY.md
+WEEKLY_REPORT_*.md

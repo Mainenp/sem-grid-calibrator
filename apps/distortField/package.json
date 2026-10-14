@@ -1,0 +1,29 @@
+{
+  "name": "distort-field",
+  "version": "1.0.0",
+  "description": "SEM grid distortion-field calibration app",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node test-grid.js",
+    "batch": "node batch-analyze.js",
+    "rectify": "node rectify-image.js",
+    "test:units": "node test-units-and-geometry.js",
+    "test:orthogonal-pair": "node test-orthogonal-pair.js",
+    "dependencies:report": "node build-dependency-report.js",
+    "test:compensation": "node test-full-compensation.js",
+    "test:tiff": "node test-tiff-compatibility.js",
+    "test:preview": "node test-preview-loading.js",
+    "test:clusters": "node test-cluster-lattice.js",
+    "test:compensation-api": "node test-compensation-api.js",
+    "compensate:validate": "node validate-full-compensation.js"
+  },
+  "private": true,
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "sharp": "^0.35.4"
+  }
+}

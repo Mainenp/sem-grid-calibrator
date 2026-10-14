@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>采集参数与畸变图表</title><link rel="stylesheet" href="parameter-dashboard.css"></head>
+<body>
+<header><a href="/">← 返回图像分析</a><h1>采集参数与畸变图表</h1><p>电压、倍率、分辨率和批次时间 · 匹配条件下的实测对比</p></header>
+<main>
+  <div id="error" class="error" role="alert" hidden></div>
+  <section class="stats" aria-label="数据质量概况">
+    <article><b id="included">—</b><span>通过质量检查 · 进入趋势图</span></article>
+    <article><b id="review">—</b><span>需复核 · 未进入主趋势</span></article>
+    <article><b id="failed">—</b><span>计算失败</span></article>
+    <article><b id="batches">—</b><span>采集批次</span></article>
+  </section>
+  <section class="controls" aria-label="图表设置">
+    <label>畸变分量<select id="metric"></select></label>
+    <label>图表形式<select id="chartType"><option value="line">折线图</option><option value="bar">柱状图</option></select></label>
+    <button id="downloadData" type="button">下载图表数据 JSON</button>
+    <a href="parameter-report.html" target="_blank" rel="noopener">查看完整说明与测试记录</a>
+  </section>
+  <p class="caption">折线显示同一匹配组随参量的变化，柱状图便于比较各水平幅度。各分量的P95不能相加；端点变化也不是参量的因果贡献率。倍率是本项目中PM所指的“采样率”，不是扫描频率。</p>
+  <section class="grid" id="charts" aria-label="参数依赖图表"></section>
+  <section class="card wide" id="compensation"><h2>26号图像完整补偿前后对比</h2><div class="chart" id="compensationChart"></div><p class="caption" id="compensationCaption"></p></section>
+  <footer id="snapshot"></footer>
+</main><script src="parameter-dashboard.js"></script>
+</body></html>
