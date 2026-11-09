@@ -303,6 +303,7 @@ $('extract').onclick = async () => {
       ? 'unavailable'
       : `${lineFit.horizontal.p95.toFixed(2)} / ${lineFit.vertical.p95.toFixed(2)} px`;
     $('fitResidual').textContent = `${result.distortion.fitResidualStats.p95.toFixed(2)} px`;
+    $('fitResidual').title = `位移模型${result.distortion.modelSelection?.selectedDegree??3}阶；交叉验证P95 ${result.distortion.modelSelection?.cubicValidationP95?.toFixed(2)??'样本不足'} px（三次候选），${result.distortion.modelSelection?.quinticValidationP95?.toFixed(2)??'样本不足'} px（五次候选）。交叉验证不等于独立物理精度。`;
     $('pitchX').textContent = `${result.pitch.x.toFixed(2)} px`;
     $('pitchY').textContent = `${result.pitch.y.toFixed(2)} px`;
     if(result.rectification) {
@@ -347,10 +348,13 @@ $('distortion').onclick = () => {
 function updateDistortionNumbers(field) {
   const reference=field.referenceLattice;
   if($('clusterPeriod')) {
-    $('clusterPeriod').textContent=reference?`${reference.column.period??'未检出'} / ${reference.row.period??'未检出'}`:'未检出';
+    const axisLabel=axis=>axis.period??(axis.status==='local-boundary'?'局部边界':'未检出');
+    $('clusterPeriod').textContent=reference?`${axisLabel(reference.column)} / ${axisLabel(reference.row)}`:'未检出';
     $('clusterHint').textContent=reference&&(reference.column.period||reference.row.period)
       ?'已将稳定重复间距作为样品结构保留；该归因依赖样品分区设计的确认，非独立绝对标定。'
-      :'未检出足够稳定的重复分区，仍使用等间距参考；少于三个完整周期时无法可靠估计。';
+      :reference&&(reference.column.status==='local-boundary'||reference.row.status==='local-boundary')
+        ?'保留不同半区共同支持的单处分区宽间隔；视野不足，未推断重复周期。该结构归因仍依赖已确认的方格样品设计。'
+        :'未检出稳定重复分区或可靠局部边界，仍使用等间距参考。';
   }
   const d=field.decomposition,c=d.coefficients.normalized,selected=selectedField();
   $('radialType').textContent=d.classification==='barrel'?'Barrel (桶型)':d.classification==='pincushion'?'Pincushion (枕型)':'Negligible';
@@ -590,7 +594,10 @@ $('validateCompensation').onclick=async()=>{
     const response=await fetch('/api/compensation-validation',{method:'POST'});
     if(response.status===404) throw new Error('新接口尚未加载，请重启算法服务后再验证');
     const report=await response.json();if(!response.ok) throw new Error(report.error||'Validation failed');
-    $('compensationResult').textContent=`重新检测平滑总场P95：${report.before.stats.p95.toFixed(2)} → ${report.after.stats.p95.toFixed(2)} px（降低${report.reductionPercent.toFixed(1)}%）；实测中心偏差P95 ${report.after.measuredStats?.p95.toFixed(2)??'未知'} px；补偿后残差${report.after.residual.p95.toFixed(2)} px；质量${report.after.quality.status}；有效像素${(report.validFraction*100).toFixed(1)}%。同图验证不等于独立物理精度标定。`;
+    const common=report.commonSupport;
+    const paired=common?.supported?`共同参考下${common.matched}个相同中心的P95：${common.before.p95.toFixed(2)} → ${common.after.p95.toFixed(2)} px（${common.status==='worsened'?'补偿变差':common.status==='improved'?'已改善':'变化较小'}）；`:'共同中心支持不足，暂不判断补偿是否改善；';
+    const support=common?.expected!=null?`完整输出单元匹配${common.matched}/${common.expected}；按输出边界预先排除${common.excludedByOutputBoundary??0}个截断单元；`:'';
+    $('compensationResult').textContent=paired+support+`独立重新拟合的平滑场P95：${report.before.stats.p95.toFixed(2)} → ${report.after.stats.p95.toFixed(2)} px${report.fieldComparison?.sameGridCounts===false?'（前后行列数量不同，不能直接比较降幅）':''}；实测中心偏差P95 ${report.after.measuredStats?.p95.toFixed(2)??'未知'} px；补偿后残差${report.after.residual.p95.toFixed(2)} px；质量${report.after.quality.status}；有效像素${(report.validFraction*100).toFixed(1)}%。同图验证不等于独立物理精度标定。`;
     download(new Blob([JSON.stringify(report,null,2)],{type:'application/json'}),'compensation-validation.json');
   }catch(error){$('compensationResult').textContent=`验证未完成：${error.message}`;}
   finally{button.disabled=!result;}
