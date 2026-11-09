@@ -66,8 +66,9 @@ displacement magnitude in pixels and the white arrows show displacement
 direction (magnified for visibility). Numeric mean, RMS, 95th-percentile, and
 maximum displacement values are reported in the side panel.
 
-The measured displacement vectors are robustly fitted with cubic 2D polynomial
-surfaces before display. This suppresses individual damaged-square detections
+The measured displacement vectors use robust cubic 2D polynomial surfaces by default.
+A quintic surface is selected only when all three spatial held-out folds show
+a material prediction improvement. This suppresses individual damaged-square detections
 and produces a continuous physical distortion field rather than a blocky map.
 
 Enable **Centers** to draw a large magenta dot with a white outline at every
@@ -172,3 +173,32 @@ Use the pilot output directory (containing `comparison.json`) as the first
 argument. Missing metadata stays missing, not zero. Trend lines connect measured
 levels within matched recorded acquisition settings. They are associations,
 not causal contributions. Batch dates are not used as elapsed calibration time.
+
+
+## 2026-11-09 single-image accuracy update
+
+The local opposite-edge thresholds now stay inside the central 35–65% of the
+patch contrast range, avoiding low-end Otsu plateau bias. Cubic remains the
+default field. With enough spatial support, a 21-term quintic candidate must
+reduce average three-fold held-out P95 by more than 0.15 px and 35%, with an
+improvement of at least 10% in every fold. Selection diagnostics are exported
+as `modelSelection`. `field-basis.js` keeps analysis and resampling consistent
+and preserves legacy cubic coefficient ordering.
+
+The following checks do not need any private microscope data:
+
+```sh
+npm run test:accuracy --workspace=distort-field
+npm run test:compensation --workspace=distort-field
+npm run test:compensation-reliability --workspace=distort-field
+npm run accuracy:validate --workspace=distort-field
+```
+
+The analytic generator renders known centers and deformation independently
+of the production field evaluator. Results include direct center error,
+known-vector error, a separate one-in-five held-out set, and re-detected PNG
+error against analytic geometry after a global similarity gauge only.
+Synthetic error bounds apply to the tested conditions. Image-fitted targets
+cannot establish absolute magnification, specimen manufacturing geometry or
+a traceable 10 nm acceptance claim. Sparse specimen repeats remain ambiguous.
+Generated TIFFs, plots, reports and acquisition data remain excluded.

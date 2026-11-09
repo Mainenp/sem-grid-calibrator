@@ -7,6 +7,8 @@ const { pipeline } = require('stream/promises');
 const sharp = require('sharp');
 const imageInputOptions = require('./image-input');
 const {inferReference}=require('./cluster-lattice');
+const {estimateOrientation,rotationTransform}=require('./grid-orientation');
+const {paddingDistance}=require('./scan-support');
 const units = require('./public/units');
 
 const PORT = Number(process.env.PORT || 4173);
@@ -60,6 +62,7 @@ function analysisSummary(result,elapsedSeconds=null) {
     distortion:{
       model:result.distortion.model,
       smoothing:result.distortion.smoothing,
+      modelSelection:result.distortion.modelSelection,
       idealPitch:result.distortion.idealPitch,
       referenceLattice:result.distortion.referenceLattice,
       rotationDegrees:result.distortion.rotationDegrees,
@@ -189,11 +192,12 @@ function estimatePitch(profile, expectedPitch=null) {
   // Repeating grids also produce strong peaks at 2x, 3x, ... the true pitch.
   // Select the earliest clear local peak that is reasonably close to the
   // strongest response, rather than blindly choosing a harmonic.
-  const candidates = scores.filter((item, i) => {
-    const left = i ? scores[i - 1].score : -Infinity;
-    const right = i + 1 < scores.length ? scores[i + 1].score : -Infinity;
-    return item.score >= left && item.score >= right && item.score >= bestScore * 0.58;
-  });
+  // A black/support edge can create a monotonically decaying response whose
+  // maximum is the search boundary. It is not a resolved periodic peak.
+  const peaks=scores.filter((item,i)=>i>0&&i+1<scores.length&&
+    item.score>=scores[i-1].score&&item.score>=scores[i+1].score);
+  const peakMaximum=peaks.reduce((v,p)=>Math.max(v,p.score),-Infinity);
+  const candidates=peaks.filter(p=>p.score>=peakMaximum*.58);
   const selected=expectedPitch&&candidates.length
     ? candidates.reduce((a,b)=>Math.abs(a.lag-expectedPitch)<Math.abs(b.lag-expectedPitch)?a:b)
     : candidates.length?candidates[0]:scores.reduce((a,b)=>a.score>b.score?a:b);
@@ -209,7 +213,17 @@ function estimatePitch(profile, expectedPitch=null) {
   return selected.lag;
 }
 
-function findPeriodicCenters(profile, expectedPitch=null) {
+function findPeriodicCenters(profile, expectedPitch=null,counts=null) {
+  if(counts){
+    const maximum=counts.reduce((a,b)=>Math.max(a,b),0);
+    let left=0,right=counts.length-1;
+    while(left<right&&counts[left]<maximum*.5)left++;
+    while(right>left&&counts[right]<maximum*.5)right--;
+    if(right-left+1>=Math.max(24,(expectedPitch||8)*3)){
+      const found=findPeriodicCenters(profile.slice(left,right+1),expectedPitch);
+      return {...found,positions:found.positions.map(p=>p+left)};
+    }
+  }
   const filtered = smooth(profile, 1);
   const pitch = estimatePitch(filtered, expectedPitch);
   let phase = 0;
@@ -388,7 +402,7 @@ function rectifiedImagePipeline(imagePath,rectification,specimenSize) {
 function polynomialFit(points, degree = 3) {
   let active = points.slice();
   const origin = points.reduce((sum, p) => sum + p[0], 0) / points.length;
-  const scale = Math.max(1, Math.max(...points.map(p => Math.abs(p[0] - origin))));
+  const scale = points.reduce((maximum,p)=>Math.max(maximum,Math.abs(p[0]-origin)),1);
   let coefficients = [];
   for (let pass = 0; pass < 3; pass++) {
     const size = degree + 1;
@@ -594,10 +608,13 @@ function computeDistortion(vertical, horizontal, columnSeeds, rowSeeds, inv, exc
   const percentile = q => magnitudes[Math.min(magnitudes.length - 1, Math.floor(q * (magnitudes.length - 1)))];
   const maximum = enriched.reduce((a,b) => a.magnitude > b.magnitude ? a : b);
   const decomposition=decomposeStandardDistortion(enriched.filter(p=>!p.excluded),enriched);
-  return {
+  const fitSupport=measured.reduce((b,p)=>({minimumColumn:Math.min(b.minimumColumn,p.column),maximumColumn:Math.max(b.maximumColumn,p.column),
+    minimumRow:Math.min(b.minimumRow,p.row),maximumRow:Math.max(b.maximumRow,p.row)}),{minimumColumn:Infinity,maximumColumn:-Infinity,minimumRow:Infinity,maximumRow:-Infinity});
+  const result={
     model:'best-fit square similarity lattice with replicated specimen spacing',
     referenceLattice,
-    smoothing:'robust cubic 2D polynomial',
+    smoothing:`robust degree-${smooth.degree||3} 2D polynomial`,
+    modelSelection:smooth.selection,
     idealPitch:Math.hypot(c,d) * inv,
     rotationDegrees:Math.atan2(d,c) * 180 / Math.PI,
     stats:{ min:magnitudes[0], mean, rms, p95:percentile(.95), max:maximum.magnitude },
@@ -606,22 +623,22 @@ function computeDistortion(vertical, horizontal, columnSeeds, rowSeeds, inv, exc
     fitSampleCount:fittedSamples.length,
     fitResidualStats,
     measuredStats:vectorStats(measured,'dx','dy'),
-    compensationModel:{smooth,lattice:{meanColumn,meanRow,centerX:meanX*inv,centerY:meanY*inv,c:c*inv,d:d*inv,
+    compensationModel:{smooth,fitSupport,lattice:{meanColumn,meanRow,centerX:meanX*inv,centerY:meanY*inv,c:c*inv,d:d*inv,
       columnCoordinates:referenceLattice.column.coordinates,rowCoordinates:referenceLattice.row.coordinates}},
     excluded:{rows:[...excludedRows],columns:[...excludedColumns]},
     decomposition,
     samples:enriched
   };
+  // Backend-only measured centers support a fixed-target, matched-cohort
+  // validation without duplicating tens of thousands of points in API JSON.
+  Object.defineProperty(result,'measuredSamples',{value:measured,enumerable:false});
+  return result;
 }
 
-function surfaceTerms(column, row, columnCount, rowCount) {
-  const u = columnCount > 1 ? 2 * column / (columnCount - 1) - 1 : 0;
-  const v = rowCount > 1 ? 2 * row / (rowCount - 1) - 1 : 0;
-  return [1, u, v, u*u, u*v, v*v, u*u*u, u*u*v, u*v*v, v*v*v];
-}
+const {surfaceTerms,evaluateField}=require('./field-basis');
 
-function fitSurface(samples, values, columnCount, rowCount) {
-  const size = 10;
+function fitSurface(samples, values, columnCount, rowCount, degree=3) {
+  const size = (degree+1)*(degree+2)/2;
   const items = samples.map((sample,index)=>({sample,value:values[index],baseWeight:sample.confidence??1,weight:sample.confidence??1}));
   let coefficients = Array(size).fill(0);
   // Iteratively reweighted least squares keeps every valid sample while
@@ -632,7 +649,7 @@ function fitSurface(samples, values, columnCount, rowCount) {
     const matrix = Array.from({length:size}, () => Array(size).fill(0));
     const vector = Array(size).fill(0);
     for (const item of items) {
-      const terms = surfaceTerms(item.sample.column, item.sample.row, columnCount, rowCount);
+      const terms = surfaceTerms(item.sample.column, item.sample.row, columnCount, rowCount, degree);
       for (let r=0;r<size;r++) {
         vector[r] += item.weight * terms[r] * item.value;
         for (let c=0;c<size;c++) matrix[r][c] += item.weight * terms[r] * terms[c];
@@ -642,7 +659,7 @@ function fitSurface(samples, values, columnCount, rowCount) {
     for(let i=0;i<size;i++) matrix[i][i] += averageDiagonal * 1e-10;
     coefficients = solveSystem(matrix, vector);
     const residuals = items.map(item => {
-      const terms = surfaceTerms(item.sample.column, item.sample.row, columnCount, rowCount);
+      const terms = surfaceTerms(item.sample.column, item.sample.row, columnCount, rowCount, degree);
       const predicted = coefficients.reduce((sum, value, i) => sum + value * terms[i], 0);
       return item.value - predicted;
     });
@@ -663,19 +680,37 @@ function fitSurface(samples, values, columnCount, rowCount) {
 }
 
 function fitSmoothVectorField(samples, columnCount, rowCount) {
-  return {
-    columnCount, rowCount,
-    dx:fitSurface(samples, samples.map(p => p.dx), columnCount, rowCount),
-    dy:fitSurface(samples, samples.map(p => p.dy), columnCount, rowCount)
-  };
+  const fit=(points,degree)=>({columnCount,rowCount,degree,
+    dx:fitSurface(points,points.map(p=>p.dx),columnCount,rowCount,degree),
+    dy:fitSurface(points,points.map(p=>p.dy),columnCount,rowCount,degree)});
+  const base=fit(samples,3);
+  // Three interleaved, deterministic folds cover the full measured domain.
+  // Model complexity is selected on points absent from each corresponding
+  // fit. This diagnoses field interpolation, not independent SEM accuracy.
+  const cols=new Set(samples.map(p=>p.column)),rows=new Set(samples.map(p=>p.row));
+  if(samples.length<126||cols.size<8||rows.size<8){
+    base.selection={method:'spatial three-fold prediction',selectedDegree:3,reason:'insufficient support for a 21-term candidate'};return base;
+  }
+  const results=[];
+  for(let fold=0;fold<3;fold++){
+    const train=samples.filter(p=>(p.column+2*p.row)%3!==fold),test=samples.filter(p=>(p.column+2*p.row)%3===fold);
+    if(train.length<84||test.length<20){base.selection={selectedDegree:3,reason:'insufficient fold support'};return base;}
+    const item={fold,training:train.length,validation:test.length};
+    for(const degree of [3,5]){const f=fit(train,degree),error=test.map(p=>{const q=evaluateField(f,p.column,p.row);return Math.hypot(q.dx-p.dx,q.dy-p.dy);}).sort((a,b)=>a-b);item[degree]=error[Math.floor((error.length-1)*.95)];}
+    results.push(item);
+  }
+  const cubic=results.reduce((s,r)=>s+r[3],0)/3,quintic=results.reduce((s,r)=>s+r[5],0)/3;
+  const useHigher=cubic-quintic>.15&&quintic<cubic*.65&&results.every(r=>r[5]<r[3]*.9);
+  const selected=useHigher?fit(samples,5):base;
+  selected.selection={method:'spatial three-fold prediction',selectedDegree:useHigher?5:3,
+    cubicValidationP95:cubic,quinticValidationP95:quintic,folds:results,
+    reason:useHigher?'quintic improves every held-out fold and exceeds relative/absolute gain thresholds':'higher order lacks consistent held-out improvement',
+    limitation:'Field prediction within this image; not an independent physical calibration'};
+  return selected;
 }
 
 function evaluateSmoothVectorField(field, column, row) {
-  const terms = surfaceTerms(column, row, field.columnCount, field.rowCount);
-  return {
-    dx:field.dx.reduce((sum, value, i) => sum + value * terms[i], 0),
-    dy:field.dy.reduce((sum, value, i) => sum + value * terms[i], 0)
-  };
+  return evaluateField(field,column,row);
 }
 
 function vectorStats(samples, dxKey, dyKey) {
@@ -695,8 +730,9 @@ function scalarStats(values) {
 }
 
 function decomposeStandardDistortion(samples,displaySamples=samples) {
-  const minX=Math.min(...samples.map(p=>p.idealX)),maxX=Math.max(...samples.map(p=>p.idealX));
-  const minY=Math.min(...samples.map(p=>p.idealY)),maxY=Math.max(...samples.map(p=>p.idealY));
+  const bounds=samples.reduce((b,p)=>({minX:Math.min(b.minX,p.idealX),maxX:Math.max(b.maxX,p.idealX),
+    minY:Math.min(b.minY,p.idealY),maxY:Math.max(b.maxY,p.idealY)}),{minX:Infinity,maxX:-Infinity,minY:Infinity,maxY:-Infinity});
+  const {minX,maxX,minY,maxY}=bounds;
   const centerX=(minX+maxX)/2,centerY=(minY+maxY)/2,radius=Math.hypot((maxX-minX)/2,(maxY-minY)/2);
   const size=9,matrix=Array.from({length:size},()=>Array(size).fill(0)),vector=Array(size).fill(0);
   const add=(row,value)=>{for(let r=0;r<size;r++){vector[r]+=row[r]*value;for(let c=0;c<size;c++)matrix[r][c]+=row[r]*row[c];}};
@@ -817,7 +853,7 @@ function otsuFromHistogram(histogram, offset) {
 function clusterAxis(values, count, initial) {
   const spacings=initial.slice(1).map((value,i)=>value-initial[i]);
   const pitch=median(spacings);
-  const length=Math.ceil(Math.max(...values))+2;
+  const length=Math.ceil(values.reduce((maximum,value)=>Math.max(maximum,value),0))+2;
   const histogram=new Float64Array(length);
   for(const value of values) histogram[Math.max(0,Math.min(length-1,Math.round(value)))]++;
   const radius=Math.max(1,Math.round(pitch*.16)),smooth=new Float64Array(length);
@@ -1021,25 +1057,33 @@ function refineCellAssignments(components,initialCells,columnCenters,rowCenters,
   return cells;
 }
 
-function extractSquaresGlobally(data,width,height,columnSeeds,rowSeeds,pitchX,pitchY) {
+function extractSquaresGlobally(data,width,height,columnSeeds,rowSeeds,pitchX,pitchY,supportDistance=null) {
   const stride=width+1;
   const integral=new Float64Array((width+1)*(height+1));
+  const integralCount=supportDistance?new Uint32Array(integral.length):null;
   for(let y=1;y<=height;y++) {
-    let rowSum=0;
-    for(let x=1;x<=width;x++) {rowSum+=data[(y-1)*width+x-1];integral[y*stride+x]=integral[(y-1)*stride+x]+rowSum;}
+    let rowSum=0,rowCount=0;
+    for(let x=1;x<=width;x++) {
+      const i=(y-1)*width+x-1,valid=!supportDistance||supportDistance[i]>0;
+      if(valid){rowSum+=data[i];rowCount++;}
+      integral[y*stride+x]=integral[(y-1)*stride+x]+rowSum;
+      if(integralCount)integralCount[y*stride+x]=integralCount[(y-1)*stride+x]+rowCount;
+    }
   }
   const radius=Math.max(8,Math.round(Math.max(pitchX,pitchY)*1.35));
   const residual=new Int16Array(width*height), histogram=new Uint32Array(511);
   for(let y=0;y<height;y++) for(let x=0;x<width;x++) {
     const x0=Math.max(0,x-radius),x1=Math.min(width-1,x+radius),y0=Math.max(0,y-radius),y1=Math.min(height-1,y+radius);
     const sum=integral[(y1+1)*stride+x1+1]-integral[y0*stride+x1+1]-integral[(y1+1)*stride+x0]+integral[y0*stride+x0];
-    const mean=sum/((x1-x0+1)*(y1-y0+1));
+    const count=integralCount?integralCount[(y1+1)*stride+x1+1]-integralCount[y0*stride+x1+1]-integralCount[(y1+1)*stride+x0]+integralCount[y0*stride+x0]:(x1-x0+1)*(y1-y0+1);
+    const mean=sum/Math.max(1,count);
     const value=Math.max(-255,Math.min(255,Math.round(data[y*width+x]-mean)));
-    residual[y*width+x]=value;histogram[value+255]++;
+    residual[y*width+x]=value;
+    if(!supportDistance||supportDistance[y*width+x]>0)histogram[value+255]++;
   }
   const threshold=otsuFromHistogram(histogram,255);
   const mask=new Uint8Array(width*height);
-  for(let i=0;i<mask.length;i++) if(residual[i]>threshold) mask[i]=1;
+  for(let i=0;i<mask.length;i++) if((!supportDistance||supportDistance[i]>0)&&residual[i]>threshold) mask[i]=1;
   const queue=new Int32Array(width*height),components=[];
   for(let start=0;start<mask.length;start++) {
     if(mask[start]!==1) continue;
@@ -1194,6 +1238,16 @@ function centerAtThreshold(data,width,patch,seed,fullPitch,threshold,maximumSeed
   }
   if(!best||best.score<=0) return null;
 
+  // Rounded corners of a clipped square can still provide a few apparent
+  // opposing edges. They do not establish its missing full-object center.
+  // Reject contact with the actual image boundary, not merely a cropped
+  // search-window boundary (a complete near-edge square may remain valid).
+  const height=Math.floor(data.length/width);
+  if(best.pixels.some(index=>{
+    const x=left+index%patchWidth,y=top+Math.floor(index/patchWidth);
+    return x===0||y===0||x===width-1||y===height-1;
+  })) return null;
+
   const rowBounds=new Map(),columnBounds=new Map();
   for(const index of best.pixels) {
     const px=index%patchWidth,py=Math.floor(index/patchWidth);
@@ -1218,7 +1272,7 @@ function centerAtThreshold(data,width,patch,seed,fullPitch,threshold,maximumSeed
     const bottomEdge=thresholdCrossing(bottomInside,data[bottomInside*width+x],bottomInside+1,data[(bottomInside+1)*width+x],threshold);
     yMidpoints.push((topEdge+bottomEdge)/2);
   }
-  if(xMidpoints.length<3||yMidpoints.length<3) return null;
+  if(xMidpoints.length<Math.max(3,.35*maxColumnSpan)||yMidpoints.length<Math.max(3,.35*maxRowSpan)) return null;
   const x=median(xMidpoints),y=median(yMidpoints);
   const spread=Math.hypot(
     1.4826*median(xMidpoints.map(value=>Math.abs(value-x))),
@@ -1227,7 +1281,7 @@ function centerAtThreshold(data,width,patch,seed,fullPitch,threshold,maximumSeed
   return {x,y,spread,area:best.area,pixels:best.pixels,left,top,patchWidth};
 }
 
-function refineSquareCenters(data,width,height,squares,scale,pitchX,pitchY,analysisMask=null,analysisWidth=0) {
+function refineSquareCenters(data,width,height,squares,scale,pitchX,pitchY,analysisMask=null,analysisWidth=0,supportDistance=null) {
   // Coarse detection stays fast on the reduced image. Final coordinates come
   // from three nearby thresholds on the original pixels; opposing boundaries
   // are linearly interpolated to subpixel positions before their midpoints are
@@ -1238,7 +1292,10 @@ function refineSquareCenters(data,width,height,squares,scale,pitchX,pitchY,analy
     // Small full-resolution squares can touch a 0.43-pitch patch boundary;
     // then otherwise valid opposite-edge measurements are discarded. Keep the
     // window below the next square's center while giving these edges room.
-    const radiusFactor=square.predicted?.72:Math.min(fullPitch.x,fullPitch.y)<32?.54:.43;
+    // Include the full square and surrounding gap also at high magnification.
+    // A 0.43-pitch window can contain almost only foreground, causing Otsu to
+    // split the grain inside the square instead of separating its boundary.
+    const radiusFactor=square.predicted?.72:.54;
     const maximumSeedDistance=square.predicted?.48:.32;
     const radiusX=Math.max(5,Math.round(fullPitch.x*radiusFactor));
     const radiusY=Math.max(5,Math.round(fullPitch.y*radiusFactor));
@@ -1250,9 +1307,23 @@ function refineSquareCenters(data,width,height,squares,scale,pitchX,pitchY,analy
     // opposite-edge estimator below rejects spans touching the window edge,
     // so let it decide whether a complete center can still be measured.
     const histogram=new Uint32Array(256);
-    for(let y=top;y<=bottom;y++) for(let x=left;x<=right;x++) histogram[data[y*width+x]]++;
-    const threshold=otsuThreshold(histogram,total);
-    const contrast=histogramPercentile(histogram,.9)-histogramPercentile(histogram,.1);
+    let histogramTotal=0;
+    for(let y=top;y<=bottom;y++) for(let x=left;x<=right;x++){
+      if(supportDistance){
+        const sx=Math.min(analysisWidth-1,Math.floor(x*scale)),sy=Math.min(Math.floor(supportDistance.length/analysisWidth)-1,Math.floor(y*scale));
+        if(supportDistance[sy*analysisWidth+sx]===0)continue;
+      }
+      histogram[data[y*width+x]]++;histogramTotal++;
+    }
+    if(histogramTotal<total*.2)return {...square,borderPartial,usedForFit:false,confidence:0,refinementRejection:'scan-support'};
+    const otsu=otsuThreshold(histogram,histogramTotal);
+    const dark=histogramPercentile(histogram,.1),bright=histogramPercentile(histogram,.9);
+    const contrast=bright-dark;
+    // A two-level patch has a whole plateau of equally optimal Otsu
+    // thresholds. Picking its first bin measures almost at the dark edge,
+    // magnifying pixel-phase/blur bias. Keep Otsu segmentation but constrain
+    // the three localization thresholds to the central contrast range.
+    const threshold=Math.max(dark+.35*contrast,Math.min(dark+.65*contrast,otsu));
     const delta=Math.max(2,Math.round(contrast*.04));
     const patch={left,top,patchWidth,patchHeight,total};
     const estimates=[threshold-delta,threshold,threshold+delta]
@@ -1333,13 +1404,89 @@ function fitLinesFromSquares(squares, columnCount, rowCount, columnSeeds, rowSee
   return {vertical,horizontal};
 }
 
+async function analyzeOriented(imagePath,options,metadata,pose){
+  const size=Math.min(metadata.width,metadata.height);
+  // Refine pose on a small probe, then resample the full scan only once.
+  const crop=Math.min(1200,Math.floor(size*.7)),margin=Math.floor((size-crop)/2);
+  const probe=await sharp(imagePath,imageInputOptions).extract({left:margin,top:margin,width:crop,height:crop})
+    .rotate(-pose.angleDegrees,{background:'#000'}).png().toBuffer();
+  const remaining=await estimateOrientation(probe,await sharp(probe).metadata());
+  const residualDegrees=remaining.confidence>.25&&Math.abs(remaining.angleDegrees)<3?remaining.angleDegrees:0;
+  const degrees=pose.angleDegrees+residualDegrees;
+  const expanded=await sharp(imagePath,imageInputOptions).extract({left:0,top:0,width:size,height:size})
+    .rotate(-degrees,{background:'#000'}).png().toBuffer();
+  const expandedMetadata=await sharp(expanded).metadata();
+  const alignedImage=await sharp(expanded).extract({left:Math.floor((expandedMetadata.width-size)/2),top:Math.floor((expandedMetadata.height-size)/2),width:size,height:size}).png().toBuffer();
+  const alignedMetadata=await sharp(alignedImage).metadata();
+  const result=await analyze(alignedImage,{...options,filename:options.filename||path.basename(typeof imagePath==='string'?imagePath:'uploaded.tif'),orientationNormalized:true});
+  const workingTransform=rotationTransform(size,size,-degrees,expandedMetadata.width,expandedMetadata.height),back=workingTransform.inverse;
+  result.centers=result.centers.map(p=>{const q=back(p.x,p.y),coarse=back(p.coarseX,p.coarseY);return {...p,...q,coarseX:coarse.x,coarseY:coarse.y};})
+    .filter(p=>p.x>=0&&p.y>=0&&p.x<size&&p.y<size);
+  const columns=Array.from({length:result.vertical.length},(_,i)=>i),rows=Array.from({length:result.horizontal.length},(_,i)=>i);
+  const fitted=fitLinesFromSquares(result.centers,columns.length,rows.length,columns,rows);
+  const distortion=computeDistortion(fitted.vertical,fitted.horizontal,columns,rows,1);
+  const rectification=fitGridRectification(result.centers,1,distortion.referenceLattice);
+  const image={width:metadata.width,height:metadata.height,specimenHeight:size};
+  distortion.image=image;distortion.physical=result.distortion.physical;
+  if(distortion.physical.fovMicrometers!=null)distortion.physical.nanometersPerPixel=distortion.physical.fovMicrometers*1000/(options.referenceScanWidth??metadata.width);
+  units.attach(distortion);
+  result.image=image;result.distortion=distortion;result.rectification=rectification;
+  result.analysis.orientationNormalization={...pose,appliedDegrees:degrees,workingWidth:alignedMetadata.width,workingHeight:alignedMetadata.height,
+    note:'Detection uses a pose-normalized scan; measured centers, field, angles and mask are mapped back to original image coordinates.'};
+  if(rectification)result.pitch={x:rectification.columnPitchPx,y:rectification.rowPitchPx};
+  const reliable=result.centers.filter(p=>p.usedForFit!==false);
+  const residual={vertical:scalarStats(reliable.map(p=>Math.abs(p.x-fitted.vertical[p.column].slope*p.y-fitted.vertical[p.column].intercept))),
+    horizontal:scalarStats(reliable.map(p=>Math.abs(p.y-fitted.horizontal[p.row].slope*p.x-fitted.horizontal[p.row].intercept)))};
+  result.quality.lineFitResidual=residual;result.squareExtraction.detected=result.centers.length;
+  result.quality.fitRate=distortion.fitSampleCount/Math.max(1,result.centers.length);
+  // The normalized working scan already counted only visible specimen cells.
+  // Returned coarse/edge candidates are not a coverage numerator.
+  if(distortion.fitResidualStats.p95>.1*Math.min(result.pitch.x,result.pitch.y)&&!result.quality.warnings.includes('smooth-field fit residual P95 exceeds 10% of the grid pitch'))
+    result.quality.warnings.push('smooth-field fit residual P95 exceeds 10% of the grid pitch');
+  if(distortion.fitResidualStats.p95>Math.max(2,distortion.stats.p95*.5)&&!result.quality.warnings.includes('center-to-field residual exceeds half the field P95 and 2 px; mode interpretation requires review'))
+    result.quality.warnings.push('center-to-field residual exceeds half the field P95 and 2 px; mode interpretation requires review');
+  result.quality.status=result.quality.warnings.length?'review':'ok';
+  distortion.measurementQuality={pitchPriorError:result.quality.pitchPriorError,detectionRate:result.quality.detectionRate};
+  result.vertical=fitted.vertical.map((line,index)=>({index,orientation:'vertical',x1:line.intercept,y1:0,x2:line.slope*size+line.intercept,y2:size,
+    points:[{x:line.intercept,y:0},{x:line.slope*size+line.intercept,y:size}],samples:line.samples}));
+  result.horizontal=fitted.horizontal.map((line,index)=>({index,orientation:'horizontal',x1:0,y1:line.intercept,x2:size,y2:line.slope*size+line.intercept,
+    points:[{x:0,y:line.intercept},{x:size,y:line.slope*size+line.intercept}],samples:line.samples}));
+  if(options.cacheResult!==false){
+    if(latestSquareMaskPng){
+      const mask=await sharp(latestSquareMaskPng).rotate(degrees,{background:{r:0,g:0,b:0,alpha:0}}).png().toBuffer();
+      const m=await sharp(mask).metadata();
+      const maskTransform=rotationTransform(size,size,degrees,m.width,m.height),origin=back(0,0);
+      const left=Math.round(Math.floor((m.width-size)/2)+maskTransform.tx-origin.x);
+      const top=Math.round(Math.floor((m.height-size)/2)+maskTransform.ty-origin.y);
+      latestSquareMaskPng=await sharp(mask).extract({left,top,width:size,height:size})
+        .extend({bottom:metadata.height-size,background:{r:0,g:0,b:0,alpha:0}}).png().toBuffer();
+    }
+    latestAnalysisContext={...latestAnalysisContext,vertical:fitted.vertical,horizontal:fitted.horizontal,columnSeeds:columns,rowSeeds:rows,inv:1,image,
+      physical:distortion.physical,rectification,distortion,quality:result.quality};
+  }
+  return result;
+}
+
 async function analyze(imagePath=DEFAULT_IMAGE,options={}) {
   const inputOptions=imageInputOptions;
   const metadata=await sharp(imagePath,inputOptions).metadata();
+  if(!options.orientationNormalized&&options.normalizeOrientation!==false){
+    const pose=await estimateOrientation(imagePath,metadata);
+    if(pose.confidence>.25&&Math.abs(pose.angleDegrees)>.8&&Math.abs(pose.angleDegrees)<=45)
+      return analyzeOriented(imagePath,options,metadata,pose);
+  }
   const sourceFilename=path.basename(options.filename||(typeof imagePath==='string'?imagePath:'uploaded.tif'));
-  const acquisition=acquisitionFromFilename(sourceFilename,metadata.width);
+  const referenceScanWidth=options.referenceScanWidth??metadata.width;
+  if(!Number.isFinite(referenceScanWidth)||referenceScanWidth<=0)throw new Error('Reference scan width must be positive');
+  const acquisition=acquisitionFromFilename(sourceFilename,referenceScanWidth);
   const suppliedFov=options.fovMicrometers;
   if(suppliedFov!=null && (!Number.isFinite(suppliedFov)||suppliedFov<=0)) throw new Error('FOV must be a positive number in micrometers');
+  // Parameter-series filenames need not encode magnification. For this known
+  // approximately 1 µm grid, supplied FOV supplies a soft search prior only.
+  if(acquisition.expectedPitch==null&&suppliedFov!=null){
+    acquisition.expectedPitch=referenceScanWidth/suppliedFov;
+    acquisition.pitchPriorSource='user-supplied FOV, approximately 1 µm specimen pitch';
+  }
   // Every supplied SEM file contains a square scan followed by a footer:
   // 1024×1086, 4096×4342, 8192×8686, ... .  Cropping at 92% cut roughly
   // 1.5 valid grid rows from the square scan.  Use the known image geometry
@@ -1374,34 +1521,53 @@ async function analyze(imagePath=DEFAULT_IMAGE,options={}) {
     if(maximum-minimum<=1) constantCorners++;
   }
   const paddedCorners=constantCorners>=2;
-  const profileLeft=Math.floor(info.width*.2),profileRight=Math.ceil(info.width*.8);
-  const profileTop=Math.floor(info.height*.2),profileBottom=Math.ceil(info.height*.8);
+  const scanSupportDistance=paddedCorners?paddingDistance(data,info.width,info.height):null;
+  const verticalCounts=scanSupportDistance?new Uint32Array(info.width):null;
+  const horizontalCounts=scanSupportDistance?new Uint32Array(info.height):null;
+  // A long cross-axis projection erases a fine tilted lattice: a <1 degree
+  // tilt accumulates several pitches across 4K. A short central band retains
+  // the fundamental period; full-frame component detection still follows.
+  const band=Math.max(24,Math.round((expectedAnalysisPitch??32)*8));
+  const profileLeft=Math.max(0,Math.floor((info.width-band)/2)),profileRight=Math.min(info.width,profileLeft+band);
+  const profileTop=Math.max(0,Math.floor((info.height-band)/2)),profileBottom=Math.min(info.height,profileTop+band);
   for (let y = 0; y < info.height; y++) {
     const row = y * info.width;
     for (let x = 0; x < info.width; x++) {
       const v = data[row + x];
-      if(!paddedCorners||(y>=profileTop&&y<profileBottom)) verticalProfile[x] += v;
-      if(!paddedCorners||(x>=profileLeft&&x<profileRight)) horizontalProfile[y] += v;
+      if(scanSupportDistance&&scanSupportDistance[row+x]===0)continue;
+      if(!paddedCorners||(y>=profileTop&&y<profileBottom)){verticalProfile[x]+=v;if(verticalCounts)verticalCounts[x]++;}
+      if(!paddedCorners||(x>=profileLeft&&x<profileRight)){horizontalProfile[y]+=v;if(horizontalCounts)horizontalCounts[y]++;}
     }
   }
-  for (let x = 0; x < info.width; x++) verticalProfile[x] /= paddedCorners?profileBottom-profileTop:info.height;
-  for (let y = 0; y < info.height; y++) horizontalProfile[y] /= paddedCorners?profileRight-profileLeft:info.width;
+  for (let x = 0; x < info.width; x++) verticalProfile[x] /= verticalCounts?Math.max(1,verticalCounts[x]):info.height;
+  for (let y = 0; y < info.height; y++) horizontalProfile[y] /= horizontalCounts?Math.max(1,horizontalCounts[y]):info.width;
 
-  const verticalSeeds=findPeriodicCenters(verticalProfile,expectedAnalysisPitch);
-  const horizontalSeeds=findPeriodicCenters(horizontalProfile,expectedAnalysisPitch);
+  const verticalSeeds=findPeriodicCenters(verticalProfile,expectedAnalysisPitch,verticalCounts);
+  const horizontalSeeds=findPeriodicCenters(horizontalProfile,expectedAnalysisPitch,horizontalCounts);
   const squareExtraction = extractSquaresGlobally(
     data, info.width, info.height,
     verticalSeeds.positions, horizontalSeeds.positions,
-    verticalSeeds.pitch, horizontalSeeds.pitch
+    verticalSeeds.pitch, horizontalSeeds.pitch,scanSupportDistance
   );
-  const { data:fullResolutionData } = await sharp(imagePath,inputOptions)
+  const localizationSigma=Math.min(verticalSeeds.pitch,horizontalSeeds.pitch)/scale>=24
+    ?Math.min(2,Math.min(verticalSeeds.pitch,horizontalSeeds.pitch)/scale*.01):0;
+  let localizationImage=sharp(imagePath,inputOptions)
     .extract({ left:0, top:0, width:metadata.width, height:specimenHeight })
-    .greyscale().raw().toBuffer({ resolveWithObject:true });
+    .greyscale();
+  if(localizationSigma>=.3)localizationImage=localizationImage.blur(localizationSigma);
+  const {data:fullResolutionData}=await localizationImage.raw().toBuffer({resolveWithObject:true});
   let squareCenters = refineSquareCenters(
     fullResolutionData, metadata.width, specimenHeight,
     squareExtraction.squares, scale, verticalSeeds.pitch, horizontalSeeds.pitch,
-    squareExtraction.acceptedMask,info.width
+    squareExtraction.acceptedMask,info.width,scanSupportDistance
   );
+  if(paddedCorners){
+    const distance=scanSupportDistance,margin=.42*Math.max(verticalSeeds.pitch,horizontalSeeds.pitch);
+    squareCenters=squareCenters.map(p=>{
+      const x=Math.max(0,Math.min(info.width-1,Math.round(p.x))),y=Math.max(0,Math.min(info.height-1,Math.round(p.y)));
+      return distance[y*info.width+x]<margin?{...p,usedForFit:false,confidence:0,borderPartial:true,refinementRejection:'scan-support'}:p;
+    });
+  }
   const recoveredFromPredictions=squareCenters.filter(p=>p.predicted&&p.usedForFit!==false).length;
   squareCenters=squareCenters.filter(p=>!p.predicted||p.usedForFit!==false);
   squareExtraction.recovered+=recoveredFromPredictions;
@@ -1443,14 +1609,14 @@ async function analyze(imagePath=DEFAULT_IMAGE,options={}) {
   rectification=fitGridRectification(squareCenters,inv,distortion.referenceLattice);
   distortion.image={width:metadata.width,height:metadata.height,specimenHeight};
   const physicalFov=suppliedFov??(acquisition.magnification?acquisition.fovMicrometers:null);
-  distortion.physical={fovMicrometers:physicalFov,nanometersPerPixel:physicalFov==null?null:physicalFov*1000/metadata.width,
+  distortion.physical={fovMicrometers:physicalFov,nanometersPerPixel:physicalFov==null?null:physicalFov*1000/referenceScanWidth,
     source:suppliedFov!=null?'user-supplied FOV':physicalFov==null?'unavailable':'estimated from magnification (not calibrated)'};
   units.attach(distortion);
   const detectedPitch={
     x:(squareExtraction.latticeBasis.columnSeedPitch??verticalSeeds.pitch)*inv,
     y:(squareExtraction.latticeBasis.rowSeedPitch??horizontalSeeds.pitch)*inv
   };
-  const expectedCount=squareExtraction.columnCenters.length*squareExtraction.rowCenters.length;
+  const nominalExpectedCount=squareExtraction.columnCenters.length*squareExtraction.rowCenters.length;
   const rowDetected=Array(squareExtraction.rowCenters.length).fill(0);
   const columnDetected=Array(squareExtraction.columnCenters.length).fill(0);
   // At a tilted image boundary, many nominal lattice sites are outside the
@@ -1465,12 +1631,19 @@ async function analyze(imagePath=DEFAULT_IMAGE,options={}) {
     const predicted=coveragePredictor(column,row);
     if(predicted.x < -marginX||predicted.x > info.width-1+marginX||
        predicted.y < -marginY||predicted.y > info.height-1+marginY) continue;
+    if(scanSupportDistance){
+      const x=Math.max(0,Math.min(info.width-1,Math.round(predicted.x))),y=Math.max(0,Math.min(info.height-1,Math.round(predicted.y)));
+      if(scanSupportDistance[y*info.width+x]<.42*Math.max(verticalSeeds.pitch,horizontalSeeds.pitch))continue;
+    }
     visibleCells.add(`${column},${row}`);
     rowVisible[row]++;columnVisible[column]++;
   }
   for(const center of squareCenters) if(visibleCells.has(`${center.column},${center.row}`)) {
     rowDetected[center.row]++;columnDetected[center.column]++;
   }
+  const expectedCount=visibleCells.size;
+  const visibleDetected=new Set(squareCenters.filter(p=>visibleCells.has(`${p.column},${p.row}`)).map(p=>`${p.column},${p.row}`)).size;
+  const detectionRate=expectedCount?visibleDetected/expectedCount:0;
   const rowCoverage=rowDetected.map((count,index)=>rowVisible[index]?Math.min(1,count/rowVisible[index]):null);
   const columnCoverage=columnDetected.map((count,index)=>columnVisible[index]?Math.min(1,count/columnVisible[index]):null);
   const interiorRows=rowCoverage.length>2?rowCoverage.slice(1,-1):rowCoverage;
@@ -1484,7 +1657,7 @@ async function analyze(imagePath=DEFAULT_IMAGE,options={}) {
   const warnings=[];
   if(acquisition.expectedPitch&&acquisition.expectedPitch<8) warnings.push('grid pitch below 8 px; center localization is sampling-limited');
   if(pitchPriorError!=null&&pitchPriorError>.2) warnings.push('detected pitch differs from the filename-based prior by more than 20%');
-  if(squareCenters.length/expectedCount<.5) warnings.push('fewer than 50% of expected squares were detected');
+  if(detectionRate<.5) warnings.push('fewer than 50% of expected squares were detected');
   if(minimumInteriorRowCoverage<.6) warnings.push('at least one interior grid row has below 60% center coverage');
   if(minimumInteriorColumnCoverage<.6) warnings.push('at least one interior grid column has below 60% center coverage');
   if(distortion.fitSampleCount/Math.max(1,squareCenters.length)<.5) warnings.push('fewer than 50% of detected centers entered the distortion fit');
@@ -1510,10 +1683,11 @@ async function analyze(imagePath=DEFAULT_IMAGE,options={}) {
   }
   const quality={
     status:warnings.length?'review':'ok',warnings,pitchPriorError,
-    detectionRate:squareCenters.length/expectedCount,
+    detectionRate,visibleDetected,visibleExpected:expectedCount,nominalExpected:nominalExpectedCount,
     fitRate:distortion.fitSampleCount/Math.max(1,squareCenters.length),
     minimumInteriorRowCoverage,minimumInteriorColumnCoverage,lineFitResidual
   };
+  distortion.measurementQuality={pitchPriorError:quality.pitchPriorError,detectionRate:quality.detectionRate};
   if(options.cacheResult!==false) {
     latestSquareMaskPng=squareMaskPng;
     latestAnalysisContext={vertical,horizontal,columnSeeds:squareExtraction.columnCenters,rowSeeds:squareExtraction.rowCenters,inv,image:distortion.image,physical:distortion.physical,rectification,distortion,quality};
@@ -1523,8 +1697,8 @@ async function analyze(imagePath=DEFAULT_IMAGE,options={}) {
     source:{filename:sourceFilename,...acquisition},
     image: { width: metadata.width, height: metadata.height, specimenHeight },
     analysis: {
-      width:info.width,height:info.height,scale,expectedPitch:expectedAnalysisPitch,
-      pitchProfileRegion:paddedCorners?'central strips (constant corner padding)':'full scan',
+      width:info.width,height:info.height,scale,expectedPitch:expectedAnalysisPitch,localizationSigma,
+      pitchProfileRegion:paddedCorners?'short central bands (constant corner padding)':'full scan',
       latticeBasis:squareExtraction.latticeBasis
     },
     pitch:detectedPitch,
@@ -1532,7 +1706,7 @@ async function analyze(imagePath=DEFAULT_IMAGE,options={}) {
     quality,
     distortion,
     squareExtraction:{
-      detected:squareCenters.length,expected:squareExtraction.columnCenters.length*squareExtraction.rowCenters.length,
+      detected:squareCenters.length,expected:expectedCount,nominalExpected:nominalExpectedCount,
       recovered:squareExtraction.recovered,
       trimmedTopRows:squareExtraction.trimmedTopRows,trimmedBottomRows:squareExtraction.trimmedBottomRows,
       rowCoverage,columnCoverage,rowVisible,columnVisible

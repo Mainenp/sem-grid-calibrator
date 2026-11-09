@@ -23,7 +23,7 @@ function template(values,period){
 }
 function detectAxis(samples,axis,count,otherCount){
   const uniform={status:'uniform',period:null,coordinates:Array.from({length:count},(_,i)=>i)};
-  if(count<13)return {...uniform,reason:'too few repeated intervals'};
+  if(count<13)return detectLocalBoundary(samples,axis,count,otherCount)||{...uniform,reason:'too few repeated intervals'};
   const map=new Map(samples.filter(p=>(p.confidence??1)>=.25).map(p=>[`${p.column},${p.row}`,p]));
   const buckets=Array.from({length:count-1},()=>[]);
   for(const p of map.values()){
@@ -32,7 +32,7 @@ function detectAxis(samples,axis,count,otherCount){
   }
   const minimum=Math.max(6,Math.ceil(otherCount*.35));
   const gaps=buckets.map(b=>b.length>=minimum?median(b):NaN),valid=gaps.filter(Number.isFinite);
-  if(valid.length<gaps.length*.8)return {...uniform,reason:'insufficient adjacent-center coverage'};
+  if(valid.length<gaps.length*.8)return detectLocalBoundary(samples,axis,count,otherCount)||{...uniform,reason:'insufficient adjacent-center coverage'};
   const pitch=median(valid),normalized=gaps.map(v=>v/pitch),residual=removeTrend(normalized);
   const finite=residual.filter(Number.isFinite),abs=finite.map(Math.abs).sort((a,b)=>a-b);
   const cap=Math.max(.002,abs[Math.floor(abs.length*.9)]*2);
@@ -59,13 +59,85 @@ function detectAxis(samples,axis,count,otherCount){
     const score=gain-.008*period;
     if(!best||score>best.score)best={period,phase,amplitude,gain,disagreement,score};
   }
-  if(!best)return {...uniform,reason:'no stable replicated block pattern'};
+  if(!best)return detectLocalBoundary(samples,axis,count,otherCount)||{...uniform,reason:'no stable replicated block pattern'};
   // Mean interval is one. This removes no mean-axis scale or smooth trend.
   const coordinates=[0];for(let i=0;i<count-1;i++)coordinates.push(coordinates.at(-1)+1+best.phase[i%best.period]);
   if(coordinates.some((v,i)=>i&&v<=coordinates[i-1]))return {...uniform,reason:'non-monotone template'};
   return {status:'grouped',period:best.period,coordinates,relativeIntervalOffsets:best.phase,
     intervalPeakToPeakPercent:100*best.amplitude,replicatedVarianceExplained:best.gain,
     crossBlockDisagreement:best.disagreement,adjacentPairCount:buckets.reduce((s,b)=>s+b.length,0)};
+}
+// A narrow view cannot establish a repeat period. It can still show one
+// specimen block boundary: a wider interval flanked by two half-size losses.
+// Fit that *zero-sum triplet*, not arbitrary measured spacing; require the
+// same geometry in independent halves of the orthogonal axis. No period is
+// invented and no mean scale or quadratic smooth distortion is removed.
+function detectLocalBoundary(samples,axis,count,otherCount){
+  if(count<6||otherCount<6)return null;
+  const other=axis==='column'?'row':'column';
+  const map=new Map(samples.filter(p=>(p.confidence??1)>=.25).map(p=>[`${p.column},${p.row}`,p]));
+  const sets=[[],[],[]].map(()=>Array.from({length:count-1},()=>[]));
+  for(const p of map.values()){
+    const q=map.get(`${p.column+(axis==='column')},${p.row+(axis==='row')}`);if(!q)continue;
+    const gap=Math.hypot(q.x-p.x,q.y-p.y),i=p[axis];sets[0][i].push(gap);sets[p[other]<otherCount/2?1:2][i].push(gap);
+  }
+  const gaps=sets.map((set,s)=>set.map(v=>v.length>=(s?3:6)?median(v):NaN));
+  const supported=gaps[0].flatMap((v,i)=>Number.isFinite(v)?[i]:[]);
+  // An expanded rotation canvas adds empty seed rows outside the specimen.
+  // They are not missing *interior* intervals. Do not count this padding as
+  // evidence against a boundary measured entirely inside the visible scan.
+  if(supported.length<5||supported.length<(supported.at(-1)-supported[0]+1)*.8)return null;
+  const limitedSupport=supported.length<7||otherCount<8;
+  const pitch=median(gaps[0].filter(Number.isFinite));
+  const fit=(values,peak)=>{
+    // A five-interval view cannot stably cross-validate four free terms.
+    // Reduce its background to a linear trend, retaining the quadratic-null
+    // baseline below so smooth curvature alone cannot count as a boundary.
+    const linearBackground=limitedSupport||peak===0||peak===count-2;
+    const size=linearBackground?3:4,normal=Array.from({length:size},()=>Array(size).fill(0)),right=Array(size).fill(0);
+    const terms=i=>{const u=2*i/(count-2)-1,s=i===peak?1:Math.abs(i-peak)===1?-.5:0;return linearBackground?[1,u,s]:[1,u,u*u,s];};
+    values.forEach((v,i)=>{if(!Number.isFinite(v))return;const t=terms(i);
+      for(let r=0;r<size;r++){right[r]+=t[r]*v/pitch;for(let c=0;c<size;c++)normal[r][c]+=t[r]*t[c];}});
+    const b=solve(normal,right),errors=values.flatMap((v,i)=>Number.isFinite(v)?[v/pitch-terms(i).reduce((s,t,j)=>s+t*b[j],0)]:[]);
+    return {amplitude:b.at(-1),noise:1.4826*median(errors.map(Math.abs)),energy:errors.reduce((s,v)=>s+v*v,0),coefficients:b,terms};
+  };
+  const base=removeTrend(gaps[0].map(v=>v/pitch)).filter(Number.isFinite).reduce((s,v)=>s+v*v,0);
+  let best=null;
+  for(let peak=0;peak<count-1;peak++){
+    const edgeBoundary=peak===0||peak===count-2;
+    if(edgeBoundary&&(supported.length<7||otherCount<8))continue;
+    const required=[peak-1,peak,peak+1].filter(i=>i>=0&&i<count-1);
+    if(gaps.some(v=>required.some(i=>!Number.isFinite(v[i]))))continue;
+    const f=fit(gaps[0],peak),a=fit(gaps[1],peak),b=fit(gaps[2],peak),gain=1-f.energy/Math.max(base,1e-12);
+    if(f.amplitude<Math.max(.02,6*f.noise)||f.amplitude>.15||gain<.85||Math.abs(a.amplitude-b.amplitude)>.2*f.amplitude||a.amplitude<=0||b.amplitude<=0)continue;
+    let heldOutMaximum=0,amplitudeVariation=0;
+    if(limitedSupport||edgeBoundary){
+      // Six complete cells provide only five intervals. Accept this narrow
+      // case only with stronger replication AND leave-one-interval-out tests.
+      // Do not invent a global repeat period from this local observation.
+      if(gain<.98||f.amplitude<10*f.noise||Math.abs(a.amplitude-b.amplitude)>.1*f.amplitude)continue;
+      for(const missing of supported){
+        const values=gaps[0].map((v,i)=>i===missing?NaN:v),omitted=fit(values,peak),t=omitted.terms(missing);
+        const prediction=t.reduce((sum,v,i)=>sum+v*omitted.coefficients[i],0);
+        heldOutMaximum=Math.max(heldOutMaximum,Math.abs(prediction-gaps[0][missing]/pitch));
+        amplitudeVariation=Math.max(amplitudeVariation,Math.abs(omitted.amplitude-f.amplitude));
+      }
+      if(heldOutMaximum>Math.max(.002,.2*f.amplitude)||amplitudeVariation>.2*f.amplitude)continue;
+    }
+    if(!best||gain>best.gain)best={peak,...f,gain,edgeBoundary,disagreement:Math.abs(a.amplitude-b.amplitude),heldOutMaximum,amplitudeVariation};
+  }
+  if(!best)return null;
+  const offsets=Array.from({length:count-1},(_,i)=>i===best.peak?best.amplitude:Math.abs(i-best.peak)===1?-best.amplitude*.5:0),coordinates=[0];
+  // A cropped triplet can lose one outer half. Center the visible template
+  // so the reference still cannot absorb mean axis magnification.
+  const average=offsets.reduce((a,b)=>a+b,0)/offsets.length;
+  for(let i=0;i<offsets.length;i++)offsets[i]-=average;
+  for(const offset of offsets)coordinates.push(coordinates.at(-1)+1+offset);
+  return {status:'local-boundary',period:null,coordinates,relativeIntervalOffsets:offsets,
+    localBoundaryIndex:best.peak,edgeBoundary:best.edgeBoundary,replicatedVarianceExplained:best.gain,crossBlockDisagreement:best.disagreement,
+    supportedIntervalCount:supported.length,limitedSupport,heldOutMaximumRelativeError:best.heldOutMaximum,
+    heldOutAmplitudeVariation:best.amplitudeVariation,
+    reason:'one zero-sum block-boundary triplet reproduced across independent row/column subsets; repeat period undetermined'};
 }
 function inferReference(samples,columnCount,rowCount){
   return {kind:'repeated-block square reference',
@@ -83,4 +155,4 @@ function indexAt(coordinates,value){
   while(hi-lo>1){const mid=(lo+hi)>>1;if(coordinates[mid]<=value)lo=mid;else hi=mid;}
   return lo+(value-coordinates[lo])/(coordinates[lo+1]-coordinates[lo]);
 }
-module.exports={inferReference,detectAxis,coordinateAt,indexAt};
+module.exports={inferReference,detectAxis,detectLocalBoundary,coordinateAt,indexAt};
